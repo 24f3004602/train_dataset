@@ -1,0 +1,44 @@
+# Large dataset files
+how2sign/
+indian_sign_language/
+test_videos/
+output_features/
+
+# Model files
+models/*.pt
+*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Numpy binary files
+*.npy
+*.npz
