@@ -12,6 +12,7 @@ import argparse
 from tqdm import tqdm
 import json
 from datetime import datetime
+import re
 
 from slt_dataset import SLTDataset, collate_fn, create_dataloaders
 from slt_model import create_model
@@ -29,6 +30,8 @@ class Trainer:
         weight_decay=0.01,
         max_epochs=100,
         save_dir='checkpoints',
+        keep_last_n=3,
+        save_optimizer_state=False,
         log_interval=50,
     ):
         self.model = model.to(device)
@@ -38,6 +41,8 @@ class Trainer:
         self.device = device
         self.max_epochs = max_epochs
         self.save_dir = save_dir
+        self.keep_last_n = keep_last_n
+        self.save_optimizer_state = save_optimizer_state
         self.log_interval = log_interval
         
         # Create inverse vocab for decoding
@@ -66,6 +71,40 @@ class Trainer:
         # Training state
         self.best_val_loss = float('inf')
         self.global_step = 0
+
+    def _safe_save(self, obj, path):
+        """Safely save checkpoint via temp file + atomic replace."""
+        tmp_path = path + '.tmp'
+        try:
+            torch.save(obj, tmp_path)
+            os.replace(tmp_path, path)
+            return True
+        except Exception as exc:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            print(f"WARNING: Failed to save checkpoint at {path}: {exc}")
+            return False
+
+    def _cleanup_old_checkpoints(self):
+        """Keep only the latest N epoch checkpoints to avoid disk exhaustion."""
+        if self.keep_last_n is None or self.keep_last_n <= 0:
+            return
+
+        epoch_files = []
+        for filename in os.listdir(self.save_dir):
+            match = re.match(r'checkpoint_epoch_(\d+)\.pt$', filename)
+            if match:
+                epoch_files.append((int(match.group(1)), filename))
+
+        epoch_files.sort(key=lambda x: x[0])
+        while len(epoch_files) > self.keep_last_n:
+            _, old_file = epoch_files.pop(0)
+            old_path = os.path.join(self.save_dir, old_file)
+            try:
+                os.remove(old_path)
+                print(f"Removed old checkpoint: {old_path}")
+            except OSError as exc:
+                print(f"WARNING: Failed to remove old checkpoint {old_path}: {exc}")
     
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -179,19 +218,24 @@ class Trainer:
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'val_loss': val_loss,
             'vocab': self.vocab,
         }
+
+        if self.save_optimizer_state:
+            checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
         path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pt')
-        torch.save(checkpoint, path)
+        saved = self._safe_save(checkpoint, path)
+        if saved:
+            self._cleanup_old_checkpoints()
         
         if is_best:
             best_path = os.path.join(self.save_dir, 'best_model.pt')
-            torch.save(checkpoint, best_path)
-            print(f"Saved best model with val_loss: {val_loss:.4f}")
+            best_saved = self._safe_save(checkpoint, best_path)
+            if best_saved:
+                print(f"Saved best model with val_loss: {val_loss:.4f}")
     
     def train(self):
         """Full training loop"""
@@ -245,6 +289,10 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--max_epochs', type=int, default=100)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--keep_last_n', type=int, default=3,
+                        help='Keep only the most recent N epoch checkpoints (0 disables cleanup)')
+    parser.add_argument('--save_optimizer_state', action='store_true',
+                        help='Include optimizer/scheduler state in checkpoints (larger files)')
     
     # System arguments
     parser.add_argument('--device', type=str, default='auto')
@@ -309,6 +357,8 @@ def main():
         weight_decay=args.weight_decay,
         max_epochs=args.max_epochs,
         save_dir=args.save_dir,
+        keep_last_n=args.keep_last_n,
+        save_optimizer_state=args.save_optimizer_state,
     )
     
     # Train
