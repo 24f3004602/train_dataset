@@ -1,8 +1,4 @@
-# Large dataset files
-how2sign/
-indian_sign_language/
-test_videos/
-output_features/
+
 
 # Model files
 models/*.pt

@@ -1,5 +1,6 @@
 torch
 torchvision
 numpy
+pandas
+tqdm
 opencv-python
-pytorch-i3d
