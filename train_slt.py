@@ -277,6 +277,7 @@ def main():
                         default='how2sign/i3d_features_how2sign/i3d_features_how2sign')
     
     # Model arguments
+    parser.add_argument('--model_type', type=str, default='transformer', choices=['transformer', 'cnn'])
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--n_encoder_layers', type=int, default=4)
     parser.add_argument('--n_decoder_layers', type=int, default=4)
@@ -339,6 +340,7 @@ def main():
     vocab_size = len(train_dataset.vocab)
     model = create_model(
         vocab_size=vocab_size,
+        model_type=args.model_type,
         d_model=args.d_model,
         n_encoder_layers=args.n_encoder_layers,
         n_decoder_layers=args.n_decoder_layers,
