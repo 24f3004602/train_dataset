@@ -13,6 +13,7 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 import re
+from contextlib import nullcontext
 
 from slt_dataset import SLTDataset, collate_fn, create_dataloaders
 from slt_model import create_model
@@ -32,6 +33,9 @@ class Trainer:
         save_dir='checkpoints',
         keep_last_n=3,
         save_optimizer_state=False,
+        label_smoothing=0.1,
+        warmup_steps=500,
+        use_amp=True,
         log_interval=50,
     ):
         self.model = model.to(device)
@@ -43,13 +47,19 @@ class Trainer:
         self.save_dir = save_dir
         self.keep_last_n = keep_last_n
         self.save_optimizer_state = save_optimizer_state
+        self.base_lr = learning_rate
+        self.warmup_steps = warmup_steps
+        self.use_amp = use_amp and device.type == 'cuda'
         self.log_interval = log_interval
         
         # Create inverse vocab for decoding
         self.inv_vocab = {v: k for k, v in vocab.items()}
         
         # Loss function (ignore padding)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=vocab['<pad>'])
+        self.criterion = nn.CrossEntropyLoss(
+            ignore_index=vocab['<pad>'],
+            label_smoothing=label_smoothing,
+        )
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -64,6 +74,8 @@ class Trainer:
             T_max=max_epochs,
             eta_min=1e-6,
         )
+
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         # Create save directory
         os.makedirs(save_dir, exist_ok=True)
@@ -126,18 +138,27 @@ class Trainer:
             
             # Forward pass
             self.optimizer.zero_grad()
-            logits = self.model(features, input_tokens, features_mask, input_mask)
-            
-            # Compute loss
-            loss = self.criterion(
-                logits.reshape(-1, logits.size(-1)),
-                target_tokens.reshape(-1),
-            )
+            amp_ctx = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
+            with amp_ctx:
+                logits = self.model(features, input_tokens, features_mask, input_mask)
+
+                # Compute loss
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    target_tokens.reshape(-1),
+                )
             
             # Backward pass
-            loss.backward()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            if self.warmup_steps > 0 and self.global_step < self.warmup_steps:
+                warmup_ratio = float(self.global_step + 1) / float(self.warmup_steps)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = self.base_lr * warmup_ratio
             
             total_loss += loss.item()
             num_batches += 1
@@ -165,12 +186,14 @@ class Trainer:
             target_tokens = tokens[:, 1:]
             input_mask = tokens_mask[:, :-1]
             
-            logits = self.model(features, input_tokens, features_mask, input_mask)
-            
-            loss = self.criterion(
-                logits.reshape(-1, logits.size(-1)),
-                target_tokens.reshape(-1),
-            )
+            amp_ctx = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
+            with amp_ctx:
+                logits = self.model(features, input_tokens, features_mask, input_mask)
+
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    target_tokens.reshape(-1),
+                )
             
             total_loss += loss.item()
             num_batches += 1
@@ -242,8 +265,28 @@ class Trainer:
         print(f"Starting training for {self.max_epochs} epochs")
         print(f"Training samples: {len(self.train_loader.dataset)}")
         print(f"Validation samples: {len(self.val_loader.dataset)}")
+
+        train_total = getattr(self.train_loader.dataset, 'total_samples', len(self.train_loader.dataset))
+        train_usable = getattr(self.train_loader.dataset, 'usable_samples', len(self.train_loader.dataset))
+        train_missing = getattr(self.train_loader.dataset, 'missing_samples', max(train_total - train_usable, 0))
+
+        val_total = getattr(self.val_loader.dataset, 'total_samples', len(self.val_loader.dataset))
+        val_usable = getattr(self.val_loader.dataset, 'usable_samples', len(self.val_loader.dataset))
+        val_missing = getattr(self.val_loader.dataset, 'missing_samples', max(val_total - val_usable, 0))
+
+        print(
+            f"Data quality (train): total={train_total}, usable={train_usable}, missing={train_missing}"
+        )
+        print(
+            f"Data quality (val): total={val_total}, usable={val_usable}, missing={val_missing}"
+        )
         
         for epoch in range(1, self.max_epochs + 1):
+            print(
+                f"Epoch {epoch} data status -> "
+                f"train usable/missing: {train_usable}/{train_missing}, "
+                f"val usable/missing: {val_usable}/{val_missing}"
+            )
             train_loss = self.train_epoch(epoch)
             val_loss = self.validate()
             
@@ -294,6 +337,10 @@ def main():
                         help='Keep only the most recent N epoch checkpoints (0 disables cleanup)')
     parser.add_argument('--save_optimizer_state', action='store_true',
                         help='Include optimizer/scheduler state in checkpoints (larger files)')
+    parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--warmup_steps', type=int, default=500)
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable mixed precision (AMP)')
     
     # System arguments
     parser.add_argument('--device', type=str, default='auto')
@@ -361,6 +408,9 @@ def main():
         save_dir=args.save_dir,
         keep_last_n=args.keep_last_n,
         save_optimizer_state=args.save_optimizer_state,
+        label_smoothing=args.label_smoothing,
+        warmup_steps=args.warmup_steps,
+        use_amp=not args.no_amp,
     )
     
     # Train

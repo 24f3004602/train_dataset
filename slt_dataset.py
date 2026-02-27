@@ -37,10 +37,69 @@ class SLTDataset(Dataset):
         # Load TSV file
         self.data = pd.read_csv(tsv_path, sep='\t')
         print(f"Loaded {len(self.data)} samples from {tsv_path}")
+        self.total_samples = len(self.data)
+
+        self.feature_col = 'signs_file' if 'signs_file' in self.data.columns else None
+        self.available_indices = self._build_available_indices()
+        self.usable_samples = len(self.available_indices)
+        self.missing_samples = self.total_samples - self.usable_samples
+        print(f"Usable samples with features: {len(self.available_indices)}/{len(self.data)}")
         
         # Build vocabulary if no tokenizer provided
         if tokenizer is None:
             self.vocab = self._build_vocab()
+
+    def _resolve_feature_path(self, row) -> Optional[str]:
+        """Resolve feature file path from row using signs_file if available, then id fallback."""
+        candidates = []
+
+        if self.feature_col is not None:
+            raw_path = row[self.feature_col]
+            if not pd.isna(raw_path):
+                raw_path = str(raw_path).strip()
+                if raw_path:
+                    candidates.append(raw_path)
+                    base_name = os.path.basename(raw_path)
+                    candidates.append(base_name)
+
+        sample_id = str(row.get('id', '')).strip()
+        if sample_id:
+            candidates.append(f"{sample_id}.npy")
+            candidates.append(sample_id)
+
+        for candidate in candidates:
+            if candidate.endswith('.npy'):
+                rel_path = candidate
+            else:
+                rel_path = f"{candidate}.npy"
+
+            direct_path = os.path.join(self.feature_root, rel_path)
+            if os.path.exists(direct_path):
+                return direct_path
+
+            base_path = os.path.join(self.feature_root, os.path.basename(rel_path))
+            if os.path.exists(base_path):
+                return base_path
+
+        return None
+
+    def _build_available_indices(self) -> List[int]:
+        """Keep only rows that have a readable feature file."""
+        available = []
+        missing = 0
+
+        for idx in range(len(self.data)):
+            row = self.data.iloc[idx]
+            if self._resolve_feature_path(row) is not None:
+                available.append(idx)
+            else:
+                missing += 1
+
+        if missing > 0:
+            print(f"WARNING: Missing feature files for {missing} samples. They will be skipped.")
+
+        self.missing_samples = missing
+        return available
         
     def _build_vocab(self) -> Dict[str, int]:
         """Build simple vocabulary from translations"""
@@ -70,22 +129,19 @@ class SLTDataset(Dataset):
         return tokens
     
     def __len__(self):
-        return len(self.data)
+        return len(self.available_indices)
     
     def __getitem__(self, idx):
-        row = self.data.iloc[idx]
+        row = self.data.iloc[self.available_indices[idx]]
         
         # Load I3D features
         sample_id = row['id']
-        
-        # Try to find the feature file
-        feature_path = os.path.join(self.feature_root, f"{sample_id}.npy")
-        
-        if os.path.exists(feature_path):
-            features = np.load(feature_path).astype(np.float32)
-        else:
-            # Return zero features if file not found
-            features = np.zeros((1, 1024), dtype=np.float32)
+
+        feature_path = self._resolve_feature_path(row)
+        if feature_path is None:
+            raise FileNotFoundError(f"Feature file not found for sample id={sample_id}")
+
+        features = np.load(feature_path).astype(np.float32)
         
         # Truncate or pad features to max_src_len
         if features.shape[0] > self.max_src_len:
